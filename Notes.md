@@ -11,7 +11,7 @@
 
 
 
-# Azure Function Deploy command:
+# Azure Function Deploy command (After inside the BackEnd folder):
  ```
 cp -r src azure-functions/src
 cp package.json azure-functions/package.json
