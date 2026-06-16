@@ -44,8 +44,8 @@ app.use(session({
   resave           : false,
   saveUninitialized: false,
   cookie: {
-    secure  : true,
-    sameSite: 'none',
+    secure  : false,
+    sameSite: 'lax',
     httpOnly: true,
     maxAge  : 24 * 60 * 60 * 1000, // 24 hours
   },
@@ -1167,37 +1167,150 @@ app.get('/api/health', (req, res) => {
 });
 
 
-app.listen(PORT, () => {
-  console.log(`🚀 API server running at http://localhost:${PORT}`);
-  console.log(`   GET  http://localhost:${PORT}/api/recommendations`);
-  console.log(`   POST http://localhost:${PORT}/api/refresh-product`);
-  console.log(`   GET  http://localhost:${PORT}/api/health`);
+
+
+
+// ─────────────────────────────────────────────────────────────
+// CATEGORY MAPPING ROUTES
+// ─────────────────────────────────────────────────────────────
+
+// ── GET /api/store-categories ─────────────────────────────────
+// Returns all store+slug pairs from urls.js as a flat list.
+// This is the "source" side of the mapping UI.
+app.get('/api/store-categories', requireRole(['admin', 'supervisor']), (req, res) => {
+  const flat = [];
+  for (const store of STORES) {
+    for (const category of store.categories) {
+      flat.push({
+        storeName: store.name,
+        storeSlug: category.slug,
+        storeUrl : category.url,
+      });
+    }
+  }
+  // Deduplicate — vedant has duplicate ssd/hdd entries in urls.js
+  const seen = new Set();
+  const deduped = flat.filter(entry => {
+    const key = `${entry.storeName}::${entry.storeSlug}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  res.json({ success: true, data: deduped });
+});
+
+
+// ── GET /api/category-mappings ────────────────────────────────
+// Returns all saved mappings from CategoryMappings table.
+app.get('/api/category-mappings', requireRole(['admin', 'supervisor']), async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request().query(`
+      SELECT ID, InternalCategory, StoreName, StoreSlug, MappedBy, MappedAt
+      FROM CategoryMappings
+      ORDER BY InternalCategory, StoreName, StoreSlug
+    `);
+    res.json({ success: true, data: result.recordset });
+  } catch (err) {
+    console.error('❌ /api/category-mappings GET error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── POST /api/category-mappings ───────────────────────────────
+// Creates or updates a mapping.
+// If the same StoreName+StoreSlug already exists, updates InternalCategory.
+app.post('/api/category-mappings', requireRole(['admin', 'supervisor']), async (req, res) => {
+  const { internalCategory, storeName, storeSlug } = req.body;
+
+  if (!internalCategory || !storeName || !storeSlug) {
+    return res.status(400).json({
+      success: false,
+      error: 'internalCategory, storeName, and storeSlug are all required',
+    });
+  }
+
+  const mappedBy = req.session?.user?.email || 'unknown';
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request()
+      .input('InternalCategory', sql.NVarChar(200), internalCategory)
+      .input('StoreName',        sql.NVarChar(100), storeName)
+      .input('StoreSlug',        sql.NVarChar(200), storeSlug)
+      .input('MappedBy',         sql.NVarChar(150), mappedBy)
+      .query(`
+        MERGE CategoryMappings AS target
+        USING (SELECT @StoreName AS StoreName, @StoreSlug AS StoreSlug) AS source
+          ON target.StoreName = source.StoreName
+         AND target.StoreSlug = source.StoreSlug
+
+        WHEN MATCHED THEN
+          UPDATE SET
+            InternalCategory = @InternalCategory,
+            MappedBy         = @MappedBy,
+            MappedAt         = GETDATE()
+
+        WHEN NOT MATCHED THEN
+          INSERT (InternalCategory, StoreName, StoreSlug, MappedBy)
+          VALUES (@InternalCategory, @StoreName, @StoreSlug, @MappedBy);
+
+        SELECT ID, InternalCategory, StoreName, StoreSlug, MappedBy, MappedAt
+        FROM CategoryMappings
+        WHERE StoreName = @StoreName AND StoreSlug = @StoreSlug;
+      `);
+
+    console.log(`✅ /api/category-mappings — mapped ${storeName}/${storeSlug} → ${internalCategory} by ${mappedBy}`);
+    res.json({ success: true, data: result.recordset[0] });
+  } catch (err) {
+    console.error('❌ /api/category-mappings POST error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── DELETE /api/category-mappings/:id ────────────────────────
+// Removes a mapping by its ID.
+app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) {
+    return res.status(400).json({ success: false, error: 'Invalid ID' });
+  }
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request()
+      .input('ID', sql.Int, id)
+      .query(`DELETE FROM CategoryMappings WHERE ID = @ID`);
+
+    if (result.rowsAffected[0] === 0) {
+      return res.status(404).json({ success: false, error: 'Mapping not found' });
+    }
+
+    console.log(`✅ /api/category-mappings DELETE — ID=${id}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`❌ /api/category-mappings DELETE error:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
 });
 
 
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+app.listen(PORT, () => {
+  console.log(`🚀 API server running at http://localhost:${PORT}`);
+  console.log(`   GET  http://localhost:${PORT}/api/recommendations`);
+  console.log(`   POST http://localhost:${PORT}/api/refresh-product`);
+  console.log(`   GET  http://localhost:${PORT}/api/health`);
+});
