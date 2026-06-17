@@ -1221,9 +1221,10 @@ app.get('/api/category-mappings', requireRole(['admin', 'supervisor']), async (r
 });
 
 
+
 // ── POST /api/category-mappings ───────────────────────────────
-// Creates or updates a mapping.
-// If the same StoreName+StoreSlug already exists, updates InternalCategory.
+// Many-to-many: always INSERTs a new row unless the exact triple
+// (StoreName + StoreSlug + InternalCategory) already exists.
 app.post('/api/category-mappings', requireRole(['admin', 'supervisor']), async (req, res) => {
   const { internalCategory, storeName, storeSlug } = req.body;
 
@@ -1244,24 +1245,23 @@ app.post('/api/category-mappings', requireRole(['admin', 'supervisor']), async (
       .input('StoreSlug',        sql.NVarChar(200), storeSlug)
       .input('MappedBy',         sql.NVarChar(150), mappedBy)
       .query(`
-        MERGE CategoryMappings AS target
-        USING (SELECT @StoreName AS StoreName, @StoreSlug AS StoreSlug) AS source
-          ON target.StoreName = source.StoreName
-         AND target.StoreSlug = source.StoreSlug
-
-        WHEN MATCHED THEN
-          UPDATE SET
-            InternalCategory = @InternalCategory,
-            MappedBy         = @MappedBy,
-            MappedAt         = GETDATE()
-
-        WHEN NOT MATCHED THEN
-          INSERT (InternalCategory, StoreName, StoreSlug, MappedBy)
+        -- Insert only if this exact triple doesn't exist yet (ignore duplicates)
+        IF NOT EXISTS (
+          SELECT 1 FROM CategoryMappings
+          WHERE StoreName        = @StoreName
+            AND StoreSlug        = @StoreSlug
+            AND InternalCategory = @InternalCategory
+        )
+        BEGIN
+          INSERT INTO CategoryMappings (InternalCategory, StoreName, StoreSlug, MappedBy)
           VALUES (@InternalCategory, @StoreName, @StoreSlug, @MappedBy);
+        END
 
         SELECT ID, InternalCategory, StoreName, StoreSlug, MappedBy, MappedAt
         FROM CategoryMappings
-        WHERE StoreName = @StoreName AND StoreSlug = @StoreSlug;
+        WHERE StoreName        = @StoreName
+          AND StoreSlug        = @StoreSlug
+          AND InternalCategory = @InternalCategory;
       `);
 
     console.log(`✅ /api/category-mappings — mapped ${storeName}/${storeSlug} → ${internalCategory} by ${mappedBy}`);
