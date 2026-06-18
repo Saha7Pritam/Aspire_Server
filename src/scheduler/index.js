@@ -80,6 +80,7 @@ const SCRAPER_CONFIG = [
   { categoryName: 'RAM', storeName: 'vedant',      slug: 'ram-memory' },
   { categoryName: 'RAM', storeName: 'vishal',      slug: 'ram-memory' },
   { categoryName: 'RAM', storeName: 'pcstudio',    slug: 'ram-memory' },
+  { categoryName: 'RAM', storeName: 'fgtech',      slug: 'ram-memory' },
 
   // ── Graphics Card ────────────────────────────────────────────
   // DB: "Graphics Card" | Scraped from all 5 stores
