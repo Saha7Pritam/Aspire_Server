@@ -194,6 +194,7 @@ function findStoreByUrl(productUrl) {
     'vedantcomputers.com'  : 'vedant',
     'vishalperipherals.com': 'vishal',
     'pcstudio.in'          : 'pcstudio',
+    'fgtechstore.com'      : 'fgtech',
   };
   for (const [domain, storeName] of Object.entries(domainMap)) {
     if (productUrl.includes(domain)) {
