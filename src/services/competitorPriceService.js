@@ -11,6 +11,7 @@
 const { v4: uuidv4 } = require('uuid');
 const sql = require('mssql');
 const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
+const { connectWithRetry } = require('../utils/connectWithRetry');
 
 // ── SQL connection ────────────────────────────────────────────
 async function getSqlPool() {
@@ -18,11 +19,9 @@ async function getSqlPool() {
     ? new ManagedIdentityCredential({ clientId: process.env.db_userclientid })
     : new AzureCliCredential();
 
-  const tokenResponse = await credential.getToken(
-    'https://database.windows.net/.default'
-  );
+  const tokenResponse = await credential.getToken('https://database.windows.net/.default');
 
-  return await sql.connect({
+  return await connectWithRetry({
     server  : process.env.db_serverendpoint,
     database: 'db_tpstechautomata',
     authentication: {
@@ -32,10 +31,11 @@ async function getSqlPool() {
     options: {
       encrypt              : true,
       trustServerCertificate: false,
-      requestTimeout       : 120_000, // increased for bulk MERGE
+      requestTimeout       : 120_000,
     },
-  });
+  }, { label: 'db_tpstechautomata' });
 }
+
 
 // ── Price parser ──────────────────────────────────────────────
 function parsePrice(priceStr) {
