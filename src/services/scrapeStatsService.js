@@ -122,17 +122,51 @@ function computeStatsForBatch(products, { allSkuSet, eligibleSkuSet }) {
   return stats;
 }
 
-// ── Step 2b: per-SKU rows for the CSV export — ONLY matched SKUs
-// (Recommendation Match + Basic Match). "No SKU Match" rows are
-// intentionally dropped — Pritam only needs to see SKUs that DID match,
-// to diagnose why they're Basic instead of Recommendation-Ready. ───────
+// ── Step 2b: per-SKU rows for the CSV export — now ALL scraped
+// products are included, not just matched ones. Manager wants visibility
+// into "No SKU Match" too, so instead of silently dropping unmatched
+// rows, they get their own MatchStatus value and a plain-English reason:
+//   "No SKU"        : competitor product had no SKU at all on the page
+//   "No SKU Match"  : competitor SKU exists, but isn't in InternalProducts
+//   "Basic Match" / "Recommendation Match" : unchanged, as before
+// Same table, same CSV, same Match Status column — just no longer
+// pre-filtered before it reaches Pritam/manager. ─────────────────────
 function collectMatchedSkuRows(products, { allSkuSet, eligibleSkuSet, detailsBySku }, context) {
   const rows = [];
 
   for (const product of products) {
     const { sku, stockStatus } = extractSkuAndStock(product);
     const key = normalizeSkuKey(sku);
-    if (!key || !allSkuSet.has(key)) continue; // no SKU / no internal match — skip, not wanted in CSV
+
+    // No SKU at all on the scraped product — still goes in the CSV now.
+    if (!key) {
+      rows.push({
+        runId        : context.runId,
+        runStartedAt : context.runStartedAt,
+        storeName    : context.storeName,
+        storeSlug    : context.storeSlug,
+        categoryNames: context.categoryNames,
+        sku          : (sku || '').trim() || '(no SKU)',
+        matchStatus  : 'No SKU',
+        reason       : 'Competitor product has no SKU',
+      });
+      continue;
+    }
+
+    // SKU exists on the competitor page, but isn't a known internal SKU.
+    if (!allSkuSet.has(key)) {
+      rows.push({
+        runId        : context.runId,
+        runStartedAt : context.runStartedAt,
+        storeName    : context.storeName,
+        storeSlug    : context.storeSlug,
+        categoryNames: context.categoryNames,
+        sku          : sku.trim(),
+        matchStatus  : 'No SKU Match',
+        reason       : 'SKU not found in InternalProducts',
+      });
+      continue;
+    }
 
     const competitorInStock = isInStock(stockStatus);
     const internal = detailsBySku.get(key) || {};
@@ -238,9 +272,10 @@ async function getRunDetail(pool, runId) {
   return { runId, rows: result.recordset };
 }
 
-// ── Step 3b: persist matched-SKU rows (small volume — only matched
-// SKUs, not all scraped products — so keeping these forever is cheap
-// and gives full CSV history, same reasoning as ScrapeRunStats). ──────
+// ── Step 3b: persist matched-SKU rows. Now includes No SKU / No SKU
+// Match rows too (see collectMatchedSkuRows above), so volume per run
+// is closer to TotalScraped than the old "matched only" subset — keep
+// an eye on table growth if this is run frequently across many stores. ──
 async function saveSkuMatchRows(pool, rows) {
   for (const row of rows) {
     await pool.request()
