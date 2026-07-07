@@ -1491,7 +1491,6 @@ app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), a
 
 
 // ── POST /api/push-to-shopify ─────────────────────────────────
-
 app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
   const { skuId, sp, isManual } = req.body;
 
