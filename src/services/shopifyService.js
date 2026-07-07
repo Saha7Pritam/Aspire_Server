@@ -17,35 +17,46 @@ async function getAccessToken() {
     return cachedToken;
   }
 
-  const response = await axios.post(
-    `https://${SHOPIFY_STORE_URL}/admin/oauth/access_token`,
-    {
+  try {
+    const params = new URLSearchParams({
       client_id: SHOPIFY_CLIENT_ID,
       client_secret: SHOPIFY_CLIENT_SECRET,
       grant_type: 'client_credentials',
-    },
-    { headers: { 'Content-Type': 'application/json' } }
-  );
+    });
 
-  cachedToken = response.data.access_token;
-  tokenFetchedAt = Date.now();
-  // NEVER console.log cachedToken or response.data here — token must stay out of logs entirely
-  return cachedToken;
+    const response = await axios.post(
+      `https://${SHOPIFY_STORE_URL}/admin/oauth/access_token`,
+      params.toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    cachedToken = response.data.access_token;
+    tokenFetchedAt = Date.now();
+    return cachedToken;
+  } catch (err) {
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    throw new Error(`Token exchange failed: ${detail}`);
+  }
 }
 
 // ── Generic GraphQL call helper ───────────────────────────────
 async function shopifyGraphQL(query, variables) {
   const accessToken = await getAccessToken();
-
-  const response = await axios.post(
-    SHOPIFY_GRAPHQL_URL,
-    { query, variables },
-    { headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken } }
-  );
-  if (response.data.errors) {
-    throw new Error(`Shopify GraphQL error: ${JSON.stringify(response.data.errors)}`);
+  try {
+    const response = await axios.post(
+      SHOPIFY_GRAPHQL_URL,
+      { query, variables },
+      { headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken } }
+    );
+    if (response.data.errors) {
+      throw new Error(`Shopify GraphQL error: ${JSON.stringify(response.data.errors)}`);
+    }
+    return response.data.data;
+  } catch (err) {
+    if (err.response?.data) {
+      throw new Error(`Shopify request failed: ${JSON.stringify(err.response.data)}`);
+    }
+    throw err;
   }
-  return response.data.data;
 }
 
 // ── Step 1: look up variant + product ID by SKU (with duplicate-safety) ──
