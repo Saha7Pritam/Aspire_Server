@@ -8,7 +8,7 @@ require('dotenv').config();
 const { getRecentRuns, getRunDetail, getRunSkuMatches, buildSkuMatchesCsv } = require('./services/scrapeStatsService');
 //
 
-
+const { pushPriceToShopify } = require('./services/shopifyService'); // add to top imports
 
 const express  = require('express');
 const cors     = require('cors');
@@ -1483,6 +1483,83 @@ app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), a
     if (pool) await pool.close();
   }
 });
+
+
+
+
+
+
+
+// ── POST /api/push-to-shopify ─────────────────────────────────
+app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
+  const { skuId, sp, isManual } = req.body;
+
+  if (!skuId || sp == null) {
+    return res.status(400).json({ success: false, error: 'skuId and sp are required' });
+  }
+  const parsedSP = parseFloat(sp);
+  if (isNaN(parsedSP) || parsedSP <= 0) {
+    return res.status(400).json({ success: false, error: 'sp must be a positive number' });
+  }
+
+  const pushedBy = req.session?.user?.email || 'unknown';
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    // Push to Shopify first — don't touch SQL if this fails
+    await pushPriceToShopify(skuId, parsedSP, pool);
+
+    const request = pool.request()
+      .input('SKU_ID',           sql.NVarChar(100),  skuId)
+      .input('SP',                sql.Decimal(10, 2), parsedSP)
+      .input('PushedBy',          sql.NVarChar(150),  pushedBy);
+
+    let updateQuery = `
+      UPDATE InternalProducts
+      SET ShopifyPushedSP = @SP, ShopifyPushedAt = GETDATE(),
+          ShopifyPushedBy = @PushedBy, ShopifyPushStatus = 'success'
+    `;
+    if (isManual) {
+      updateQuery += `,
+          ManualRecommendedSP = @SP, ManualRecommendedSP_UpdatedAt = GETDATE(),
+          ManualRecommendedSP_UpdatedBy = @PushedBy
+      `;
+    }
+    updateQuery += ` WHERE SKU_ID = @SKU_ID;
+      SELECT SKU_ID, RecommendedSP, ManualRecommendedSP, ShopifyPushedSP, ShopifyPushedAt
+      FROM InternalProducts WHERE SKU_ID = @SKU_ID;
+    `;
+
+    const result = await request.query(updateQuery);
+
+    if (!result.recordset.length) {
+      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+    }
+    console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} | By=${pushedBy} | Manual=${!!isManual}`);
+    res.json({ success: true, data: result.recordset[0] });
+  } catch (err) {
+    console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
+    // Best-effort: mark the push as failed for audit, without blocking the error response
+    try {
+      const failPool = await getSqlPool();
+      await failPool.request()
+        .input('SKU_ID', sql.NVarChar(100), skuId)
+        .query(`UPDATE InternalProducts SET ShopifyPushStatus = 'failed' WHERE SKU_ID = @SKU_ID`);
+    } catch (_) {}
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
+
+
+
+
+
 
 
 
