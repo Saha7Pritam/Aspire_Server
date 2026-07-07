@@ -1492,7 +1492,7 @@ app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), a
 
 // ── POST /api/push-to-shopify ─────────────────────────────────
 app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
-  const { skuId, sp, isManual } = req.body;
+  const { skuId, sp, isManual, confirmVariance } = req.body;
 
   if (!skuId || sp == null) {
     return res.status(400).json({ success: false, error: 'skuId and sp are required' });
@@ -1507,13 +1507,35 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
   try {
     pool = await getSqlPool();
 
+    // ── Variance check — against your own DB, before Shopify is touched at all ──
+    const checkRow = await pool.request()
+      .input('SKU_ID', sql.NVarChar(100), skuId)
+      .query(`SELECT RecommendedSP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
+
+    if (!checkRow.recordset.length) {
+      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+    }
+
+    const systemSP = parseFloat(checkRow.recordset[0].RecommendedSP);
+    const VARIANCE_THRESHOLD = 0.20; // 20%
+    const variance = systemSP > 0 ? Math.abs(parsedSP - systemSP) / systemSP : 0;
+
+    if (variance > VARIANCE_THRESHOLD && !confirmVariance) {
+      return res.status(422).json({
+        success: false,
+        error: 'variance_check_failed',
+        message: `Entered SP (₹${parsedSP}) differs from system RecommendedSP (₹${systemSP}) by ${(variance * 100).toFixed(1)}%. Confirm to proceed.`,
+        systemSP,
+      });
+    }
+
     // Push to Shopify first — don't touch SQL if this fails
-    await pushPriceToShopify(skuId, parsedSP, pool);
+    await pushPriceToShopify(skuId, parsedSP);
 
     const request = pool.request()
-      .input('SKU_ID',           sql.NVarChar(100),  skuId)
-      .input('SP',                sql.Decimal(10, 2), parsedSP)
-      .input('PushedBy',          sql.NVarChar(150),  pushedBy);
+      .input('SKU_ID',    sql.NVarChar(100),  skuId)
+      .input('SP',        sql.Decimal(10, 2), parsedSP)
+      .input('PushedBy',  sql.NVarChar(150),  pushedBy);
 
     let updateQuery = `
       UPDATE InternalProducts
@@ -1533,14 +1555,10 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
 
     const result = await request.query(updateQuery);
 
-    if (!result.recordset.length) {
-      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
-    }
     console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} | By=${pushedBy} | Manual=${!!isManual}`);
     res.json({ success: true, data: result.recordset[0] });
   } catch (err) {
     console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
-    // Best-effort: mark the push as failed for audit, without blocking the error response
     try {
       const failPool = await getSqlPool();
       await failPool.request()
