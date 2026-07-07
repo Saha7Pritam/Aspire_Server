@@ -1,14 +1,46 @@
 // src/services/shopifyService.js
 const axios = require('axios');
 
-const SHOPIFY_GRAPHQL_URL   = process.env.SHOPIFY_STAGING_GRAPHQL_URL;
-const SHOPIFY_ACCESS_TOKEN  = process.env.SHOPIFY_STAGING_TOKEN;
+const SHOPIFY_STORE_URL     = process.env.shopify_store_url;      // e.g. tpstech.myshopify.com — used for OAuth token exchange
+const SHOPIFY_GRAPHQL_URL   = process.env.Shopify_graph_URL;      // full graphql.json endpoint
+const SHOPIFY_CLIENT_ID     = process.env.shopify_prod_clientid;
+const SHOPIFY_CLIENT_SECRET = process.env.shopify_prod_secret;
 
+const TOKEN_MAX_AGE_MS = 20 * 60 * 60 * 1000; // hard refresh every 20h regardless of Shopify's expires_in (UTC vs IST safety)
+
+let cachedToken = null;
+let tokenFetchedAt = 0;
+
+// ── Get (or refresh) the OAuth access token ───────────────────
+async function getAccessToken() {
+  if (cachedToken && (Date.now() - tokenFetchedAt) < TOKEN_MAX_AGE_MS) {
+    return cachedToken;
+  }
+
+  const response = await axios.post(
+    `https://${SHOPIFY_STORE_URL}/admin/oauth/access_token`,
+    {
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+      grant_type: 'client_credentials',
+    },
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+
+  cachedToken = response.data.access_token;
+  tokenFetchedAt = Date.now();
+  // NEVER console.log cachedToken or response.data here — token must stay out of logs entirely
+  return cachedToken;
+}
+
+// ── Generic GraphQL call helper ───────────────────────────────
 async function shopifyGraphQL(query, variables) {
+  const accessToken = await getAccessToken();
+
   const response = await axios.post(
     SHOPIFY_GRAPHQL_URL,
     { query, variables },
-    { headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN } }
+    { headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken } }
   );
   if (response.data.errors) {
     throw new Error(`Shopify GraphQL error: ${JSON.stringify(response.data.errors)}`);
@@ -16,22 +48,26 @@ async function shopifyGraphQL(query, variables) {
   return response.data.data;
 }
 
-// Step 1: look up variant + product ID by SKU
+// ── Step 1: look up variant + product ID by SKU (with duplicate-safety) ──
 async function getShopifyVariantBySku(sku) {
   const query = `
     query getVariantBySku($query: String!) {
-      productVariants(first: 1, query: $query) {
-        edges { node { id price product { id } } }
+      productVariants(first: 5, query: $query) {
+        edges { node { id price sku product { id } } }
       }
     }
   `;
   const data = await shopifyGraphQL(query, { query: `sku:${sku}` });
-  const edge = data.productVariants.edges[0];
-  if (!edge) throw new Error(`No Shopify variant found for SKU: ${sku}`);
-  return { variantId: edge.node.id, productId: edge.node.product.id };
+  const matches = data.productVariants.edges.filter(e => e.node.sku === sku); // exact match only
+
+  if (matches.length === 0) throw new Error(`No Shopify variant found for SKU: ${sku}`);
+  if (matches.length > 1) throw new Error(`Ambiguous SKU: ${sku} matched ${matches.length} variants — refusing to guess`);
+
+  const node = matches[0].node;
+  return { variantId: node.id, productId: node.product.id };
 }
 
-// Step 2: update the price
+// ── Step 2: update the price ──────────────────────────────────
 async function updateVariantPrice(productId, variantId, price) {
   const mutation = `
     mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
@@ -57,3 +93,35 @@ async function pushPriceToShopify(skuId, price) {
 }
 
 module.exports = { pushPriceToShopify };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+
+Did we already do the "2 API calls" thing?
+Yes — you already built exactly what Krishna described. Look at the code from before:
+
+Call 1 = getShopifyVariantBySku(sku) — looks up the product by SKU, gets back the variantId + productId.
+Call 2 = updateVariantPrice(productId, variantId, price) — the actual productVariantsBulkUpdate mutation that changes the price.
+
+That matches his "first API retrieves product details via SKU, second API updates the price" description exactly.
+The variance check is a different thing entirely — that's not a Shopify API call at all. It's your own SQL check (comparing the entered price against RecommendedSP in your own database) that happens before you even talk to Shopify.
+"2 API calls" comment was purely about the Shopify integration; the variance check is a safety feature you added on your side, unrelated to that count.
+So you're not missing a call — you just have three separate steps total: 
+  (1) variance check against your DB, 
+  (2) SKU lookup on Shopify, 
+  (3) price mutation on Shopify.
+
+*/
