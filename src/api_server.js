@@ -326,6 +326,34 @@ async function recalculateRecommendedSP(pool, skuId) {
 }
 
 
+
+
+// ── Persist live-calculated RecommendedSP for Basic Recommendations ──
+// Runs after computing rows, in chunks, so the variance check on push
+// has a real number to compare against instead of NULL.
+async function persistRecommendedSP(pool, rows) {
+  const CHUNK_SIZE = 400; // stay well under SQL Server's parameter limit
+  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + CHUNK_SIZE);
+    const request = pool.request();
+    const valuesClauses = chunk.map((row, idx) => {
+      request.input(`sku${idx}`, sql.NVarChar(100), row.SKU_ID);
+      request.input(`rsp${idx}`, sql.Decimal(10, 2), row.RecommendedSP);
+      return `(@sku${idx}, @rsp${idx})`;
+    });
+
+    const query = `
+      UPDATE ip
+      SET ip.RecommendedSP = v.RecommendedSP, ip.RecommendedSPUpdatedAt = GETDATE()
+      FROM InternalProducts ip
+      JOIN (VALUES ${valuesClauses.join(', ')}) AS v(SKU_ID, RecommendedSP)
+        ON ip.SKU_ID = v.SKU_ID;
+    `;
+    await request.query(query);
+  }
+}
+
+
 // ─────────────────────────────────────────────────────────────
 // ROUTES
 // ─────────────────────────────────────────────────────────────
@@ -380,6 +408,61 @@ app.get('/api/recommendations', async (req, res) => {
 // Eligibility: PP available + isActive + isInStock (same filter as
 // loadInternalProducts). Computed live on every request — cheap,
 // deterministic, no job/polling needed.
+// app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+
+//     const categorySettings = await loadCategorySettings(pool);
+//     const internalProducts = await loadInternalProducts(pool);
+
+//     const rows = internalProducts.map(product => {
+//       const { effectivePP, source } = resolveEffectivePP(product);
+//       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+//       const multiplier     = 1 + gst + costOfBusiness + profitMargin;
+//       const recommendedSP  = parseFloat((effectivePP * multiplier).toFixed(2));
+
+//       return {
+//         SKU_ID       : product.SKU_ID,
+//         Title        : product.Title,
+//         Category     : product.Category,
+//         PP           : effectivePP,
+//         PPSource     : source,
+//         SP           : product.SP != null ? parseFloat(product.SP) : null,
+//         RecommendedSP: recommendedSP,
+//         GSTPct       : parseFloat((gst * 100).toFixed(2)),
+//         COBPct       : parseFloat((costOfBusiness * 100).toFixed(2)),
+//         MarginPct    : parseFloat((profitMargin * 100).toFixed(2)),
+//       };
+//     });
+
+//     console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products`);
+//     res.json({ success: true, data: rows });
+//   } catch (err) {
+//     console.error('❌ /api/internal-recommendations error:', err.message);
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
+
+
+
+
+
+
+
+
+
+
+
+// ── GET /api/internal-recommendations ─────────────────────────
+// Internal-data-only RecommendedSP — no competitor matching at all.
+// Eligibility: PP available + isActive + isInStock, MINUS any SKU
+// that's eligible for the Competitor Based table (that table has
+// priority — a SKU should never appear in both).
+// Computed live on every request, and persisted to SQL so the
+// variance check on push has a real value to compare against.
 app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
   let pool;
   try {
@@ -388,7 +471,24 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
     const categorySettings = await loadCategorySettings(pool);
     const internalProducts = await loadInternalProducts(pool);
 
-    const rows = internalProducts.map(product => {
+    // Fetch the set of SKUs that qualify for Competitor Based Recommendation —
+    // same match condition used in /api/recommendations (valid competitor price,
+    // competitor not out of stock). Basic Recommendations must exclude these.
+    const competitorMatchResult = await pool.request().query(`
+      SELECT DISTINCT SKU
+      FROM CompetitorPrices
+      WHERE CompetitorPrice IS NOT NULL
+        AND LOWER(StockStatus) != 'out of stock'
+    `);
+    const competitorMatchedSkus = new Set(
+      competitorMatchResult.recordset.map(r => (r.SKU || '').trim().toUpperCase())
+    );
+
+    const eligibleProducts = internalProducts.filter(
+      product => !competitorMatchedSkus.has((product.SKU_ID || '').trim().toUpperCase())
+    );
+
+    const rows = eligibleProducts.map(product => {
       const { effectivePP, source } = resolveEffectivePP(product);
       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
       const multiplier     = 1 + gst + costOfBusiness + profitMargin;
@@ -408,7 +508,14 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
       };
     });
 
-    console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products`);
+    // Persist so the variance check on push has a real value to compare against.
+    try {
+      await persistRecommendedSP(pool, rows);
+    } catch (persistErr) {
+      console.error('⚠️ Failed to persist RecommendedSP (non-fatal):', persistErr.message);
+    }
+
+    console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products (excluded ${competitorMatchedSkus.size} competitor-matched SKUs)`);
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error('❌ /api/internal-recommendations error:', err.message);
@@ -417,6 +524,9 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
     if (pool) await pool.close();
   }
 });
+
+
+
 
 
 
@@ -1602,7 +1712,7 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
     const systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
 
-    const VARIANCE_THRESHOLD = 0.20; // 20%
+    const VARIANCE_THRESHOLD = 0.10; // 20%
     let variance = 0;
     let requiresConfirm = false;
 
