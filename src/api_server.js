@@ -326,6 +326,34 @@ async function recalculateRecommendedSP(pool, skuId) {
 }
 
 
+
+
+// ── Persist live-calculated RecommendedSP for Basic Recommendations ──
+// Runs after computing rows, in chunks, so the variance check on push
+// has a real number to compare against instead of NULL.
+async function persistRecommendedSP(pool, rows) {
+  const CHUNK_SIZE = 400; // stay well under SQL Server's parameter limit
+  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + CHUNK_SIZE);
+    const request = pool.request();
+    const valuesClauses = chunk.map((row, idx) => {
+      request.input(`sku${idx}`, sql.NVarChar(100), row.SKU_ID);
+      request.input(`rsp${idx}`, sql.Decimal(10, 2), row.RecommendedSP);
+      return `(@sku${idx}, @rsp${idx})`;
+    });
+
+    const query = `
+      UPDATE ip
+      SET ip.RecommendedSP = v.RecommendedSP, ip.RecommendedSPUpdatedAt = GETDATE()
+      FROM InternalProducts ip
+      JOIN (VALUES ${valuesClauses.join(', ')}) AS v(SKU_ID, RecommendedSP)
+        ON ip.SKU_ID = v.SKU_ID;
+    `;
+    await request.query(query);
+  }
+}
+
+
 // ─────────────────────────────────────────────────────────────
 // ROUTES
 // ─────────────────────────────────────────────────────────────
@@ -380,6 +408,61 @@ app.get('/api/recommendations', async (req, res) => {
 // Eligibility: PP available + isActive + isInStock (same filter as
 // loadInternalProducts). Computed live on every request — cheap,
 // deterministic, no job/polling needed.
+// app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+
+//     const categorySettings = await loadCategorySettings(pool);
+//     const internalProducts = await loadInternalProducts(pool);
+
+//     const rows = internalProducts.map(product => {
+//       const { effectivePP, source } = resolveEffectivePP(product);
+//       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+//       const multiplier     = 1 + gst + costOfBusiness + profitMargin;
+//       const recommendedSP  = parseFloat((effectivePP * multiplier).toFixed(2));
+
+//       return {
+//         SKU_ID       : product.SKU_ID,
+//         Title        : product.Title,
+//         Category     : product.Category,
+//         PP           : effectivePP,
+//         PPSource     : source,
+//         SP           : product.SP != null ? parseFloat(product.SP) : null,
+//         RecommendedSP: recommendedSP,
+//         GSTPct       : parseFloat((gst * 100).toFixed(2)),
+//         COBPct       : parseFloat((costOfBusiness * 100).toFixed(2)),
+//         MarginPct    : parseFloat((profitMargin * 100).toFixed(2)),
+//       };
+//     });
+
+//     console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products`);
+//     res.json({ success: true, data: rows });
+//   } catch (err) {
+//     console.error('❌ /api/internal-recommendations error:', err.message);
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
+
+
+
+
+
+
+
+
+
+
+
+// ── GET /api/internal-recommendations ─────────────────────────
+// Internal-data-only RecommendedSP — no competitor matching at all.
+// Eligibility: PP available + isActive + isInStock, MINUS any SKU
+// that's eligible for the Competitor Based table (that table has
+// priority — a SKU should never appear in both).
+// Computed live on every request, and persisted to SQL so the
+// variance check on push has a real value to compare against.
 app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
   let pool;
   try {
@@ -388,7 +471,24 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
     const categorySettings = await loadCategorySettings(pool);
     const internalProducts = await loadInternalProducts(pool);
 
-    const rows = internalProducts.map(product => {
+    // Fetch the set of SKUs that qualify for Competitor Based Recommendation —
+    // same match condition used in /api/recommendations (valid competitor price,
+    // competitor not out of stock). Basic Recommendations must exclude these.
+    const competitorMatchResult = await pool.request().query(`
+      SELECT DISTINCT SKU
+      FROM CompetitorPrices
+      WHERE CompetitorPrice IS NOT NULL
+        AND LOWER(StockStatus) != 'out of stock'
+    `);
+    const competitorMatchedSkus = new Set(
+      competitorMatchResult.recordset.map(r => (r.SKU || '').trim().toUpperCase())
+    );
+
+    const eligibleProducts = internalProducts.filter(
+      product => !competitorMatchedSkus.has((product.SKU_ID || '').trim().toUpperCase())
+    );
+
+    const rows = eligibleProducts.map(product => {
       const { effectivePP, source } = resolveEffectivePP(product);
       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
       const multiplier     = 1 + gst + costOfBusiness + profitMargin;
@@ -408,7 +508,14 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
       };
     });
 
-    console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products`);
+    // Persist so the variance check on push has a real value to compare against.
+    try {
+      await persistRecommendedSP(pool, rows);
+    } catch (persistErr) {
+      console.error('⚠️ Failed to persist RecommendedSP (non-fatal):', persistErr.message);
+    }
+
+    console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products (excluded ${competitorMatchedSkus.size} competitor-matched SKUs)`);
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error('❌ /api/internal-recommendations error:', err.message);
@@ -417,6 +524,9 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
     if (pool) await pool.close();
   }
 });
+
+
+
 
 
 
@@ -1573,6 +1683,108 @@ app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), a
 
 
 
+
+
+
+
+// ── POST /api/push-to-shopify ─────────────────────────────────
+// app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
+//   const { skuId, sp, isManual, confirmVariance } = req.body;
+
+//   if (!skuId || sp == null) {
+//     return res.status(400).json({ success: false, error: 'skuId and sp are required' });
+//   }
+//   const parsedSP = parseFloat(sp);
+//   if (isNaN(parsedSP) || parsedSP <= 0) {
+//     return res.status(400).json({ success: false, error: 'sp must be a positive number' });
+//   }
+
+//   const pushedBy = req.session?.user?.email || 'unknown';
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+
+//     // ── Variance check — against your own DB, before Shopify is touched at all ──
+//     const checkRow = await pool.request()
+//       .input('SKU_ID', sql.NVarChar(100), skuId)
+//       .query(`SELECT RecommendedSP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
+
+//     if (!checkRow.recordset.length) {
+//       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+//     }
+
+//     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
+//     const systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
+
+//     const VARIANCE_THRESHOLD = 0.10; // 20%
+//     let variance = 0;
+//     let requiresConfirm = false;
+
+//     if (systemSP === null || isNaN(systemSP) || systemSP <= 0) {
+//       // No reliable system value to compare against (e.g. Basic Recommendations view,
+//       // where RecommendedSP is computed live and never persisted) — force confirmation
+//       // instead of silently letting anything through.
+//       requiresConfirm = true;
+//     } else {
+//       variance = Math.abs(parsedSP - systemSP) / systemSP;
+//       requiresConfirm = variance > VARIANCE_THRESHOLD;
+//     }
+
+//     if (requiresConfirm && !confirmVariance) {
+//       return res.status(422).json({
+//         success: false,
+//         error: 'variance_check_failed',
+//         message: systemSP
+//           ? `Entered SP (₹${parsedSP}) differs from system RecommendedSP (₹${systemSP}) by ${(variance * 100).toFixed(1)}%. Confirm to proceed.`
+//           : `No system-calculated RecommendedSP is stored for this SKU yet — please confirm ₹${parsedSP} is correct before pushing.`,
+//         systemSP,
+//       });
+//     }
+
+//     // Push to Shopify first — don't touch SQL if this fails
+//     await pushPriceToShopify(skuId, parsedSP);
+
+//     const request = pool.request()
+//       .input('SKU_ID',    sql.NVarChar(100),  skuId)
+//       .input('SP',        sql.Decimal(10, 2), parsedSP)
+//       .input('PushedBy',  sql.NVarChar(150),  pushedBy);
+
+//     let updateQuery = `
+//       UPDATE InternalProducts
+//       SET ShopifyPushedSP = @SP, ShopifyPushedAt = GETDATE(),
+//           ShopifyPushedBy = @PushedBy, ShopifyPushStatus = 'success'
+//     `;
+//     if (isManual) {
+//       updateQuery += `,
+//           ManualRecommendedSP = @SP, ManualRecommendedSP_UpdatedAt = GETDATE(),
+//           ManualRecommendedSP_UpdatedBy = @PushedBy
+//       `;
+//     }
+//     updateQuery += ` WHERE SKU_ID = @SKU_ID;
+//       SELECT SKU_ID, RecommendedSP, ManualRecommendedSP, ShopifyPushedSP, ShopifyPushedAt
+//       FROM InternalProducts WHERE SKU_ID = @SKU_ID;
+//     `;
+
+//     const result = await request.query(updateQuery);
+
+//     console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} | By=${pushedBy} | Manual=${!!isManual}`);
+//     res.json({ success: true, data: result.recordset[0] });
+//   } catch (err) {
+//     console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
+//     try {
+//       const failPool = await getSqlPool();
+//       await failPool.request()
+//         .input('SKU_ID', sql.NVarChar(100), skuId)
+//         .query(`UPDATE InternalProducts SET ShopifyPushStatus = 'failed' WHERE SKU_ID = @SKU_ID`);
+//     } catch (_) {}
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
+
+
+
 // ── POST /api/push-to-shopify ─────────────────────────────────
 app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
   const { skuId, sp, isManual, confirmVariance } = req.body;
@@ -1593,23 +1805,21 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
     // ── Variance check — against your own DB, before Shopify is touched at all ──
     const checkRow = await pool.request()
       .input('SKU_ID', sql.NVarChar(100), skuId)
-      .query(`SELECT RecommendedSP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
+      .query(`SELECT RecommendedSP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`); // ← added SP
 
     if (!checkRow.recordset.length) {
       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
     }
 
+    const currentSP = checkRow.recordset[0].SP; // ← NEW: value before this push, for OldSellingPrice
     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
     const systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
 
-    const VARIANCE_THRESHOLD = 0.20; // 20%
+    const VARIANCE_THRESHOLD = 0.20;
     let variance = 0;
     let requiresConfirm = false;
 
     if (systemSP === null || isNaN(systemSP) || systemSP <= 0) {
-      // No reliable system value to compare against (e.g. Basic Recommendations view,
-      // where RecommendedSP is computed live and never persisted) — force confirmation
-      // instead of silently letting anything through.
       requiresConfirm = true;
     } else {
       variance = Math.abs(parsedSP - systemSP) / systemSP;
@@ -1631,14 +1841,16 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
     await pushPriceToShopify(skuId, parsedSP);
 
     const request = pool.request()
-      .input('SKU_ID',    sql.NVarChar(100),  skuId)
-      .input('SP',        sql.Decimal(10, 2), parsedSP)
-      .input('PushedBy',  sql.NVarChar(150),  pushedBy);
+      .input('SKU_ID',          sql.NVarChar(100),  skuId)
+      .input('SP',              sql.Decimal(10, 2), parsedSP)
+      .input('OldSellingPrice', sql.Decimal(10, 2), currentSP) // ← NEW
+      .input('PushedBy',        sql.NVarChar(150),  pushedBy);
 
     let updateQuery = `
       UPDATE InternalProducts
       SET ShopifyPushedSP = @SP, ShopifyPushedAt = GETDATE(),
-          ShopifyPushedBy = @PushedBy, ShopifyPushStatus = 'success'
+          ShopifyPushedBy = @PushedBy, ShopifyPushStatus = 'success',
+          OldSellingPrice = @OldSellingPrice
     `;
     if (isManual) {
       updateQuery += `,
@@ -1647,13 +1859,13 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
       `;
     }
     updateQuery += ` WHERE SKU_ID = @SKU_ID;
-      SELECT SKU_ID, RecommendedSP, ManualRecommendedSP, ShopifyPushedSP, ShopifyPushedAt
+      SELECT SKU_ID, RecommendedSP, ManualRecommendedSP, ShopifyPushedSP, ShopifyPushedAt, OldSellingPrice
       FROM InternalProducts WHERE SKU_ID = @SKU_ID;
     `;
 
     const result = await request.query(updateQuery);
 
-    console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} | By=${pushedBy} | Manual=${!!isManual}`);
+    console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} (was ₹${currentSP ?? 'N/A'}) | By=${pushedBy} | Manual=${!!isManual}`);
     res.json({ success: true, data: result.recordset[0] });
   } catch (err) {
     console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
@@ -1668,6 +1880,7 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
     if (pool) await pool.close();
   }
 });
+
 
 
 
