@@ -354,6 +354,24 @@ async function persistRecommendedSP(pool, rows) {
 }
 
 
+
+
+// ── Read a numeric AppSettings value, with a safe fallback ──────
+async function getNumericSetting(pool, key, fallback) {
+  try {
+    const result = await pool.request()
+      .input('Key', sql.NVarChar(100), key)
+      .query(`SELECT SettingValue FROM AppSettings WHERE SettingKey = @Key`);
+    const raw = result.recordset[0]?.SettingValue;
+    const parsed = parseFloat(raw);
+    return isNaN(parsed) ? fallback : parsed;
+  } catch {
+    return fallback; // never let a settings-lookup failure block a push
+  }
+}
+
+
+
 // ─────────────────────────────────────────────────────────────
 // ROUTES
 // ─────────────────────────────────────────────────────────────
@@ -948,6 +966,74 @@ app.get('/api/bulk-upload-session/:sessionId/export', requireAuth, async (req, r
     if (pool) await pool.close();
   }
 });
+
+
+
+
+
+
+
+// ── GET /api/app-settings/:key ──────────────────────────────────
+app.get('/api/app-settings/:key', requireAuth, async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request()
+      .input('Key', sql.NVarChar(100), req.params.key)
+      .query(`SELECT SettingKey, SettingValue, UpdatedAt, UpdatedBy FROM AppSettings WHERE SettingKey = @Key`);
+
+    if (!result.recordset.length) {
+      return res.status(404).json({ success: false, error: `Setting not found: ${req.params.key}` });
+    }
+    res.json({ success: true, data: result.recordset[0] });
+  } catch (err) {
+    console.error('❌ /api/app-settings GET error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
+
+
+// ── PUT /api/app-settings/:key ──────────────────────────────────
+app.put('/api/app-settings/:key', requireAuth, async (req, res) => {
+  const { value } = req.body;
+  if (value == null || value === '') {
+    return res.status(400).json({ success: false, error: 'value is required' });
+  }
+
+  const updatedBy = req.session?.user?.email || 'unknown';
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request()
+      .input('Key',       sql.NVarChar(100), req.params.key)
+      .input('Value',     sql.NVarChar(100), String(value))
+      .input('UpdatedBy', sql.NVarChar(150), updatedBy)
+      .query(`
+        UPDATE AppSettings
+        SET SettingValue = @Value, UpdatedAt = GETDATE(), UpdatedBy = @UpdatedBy
+        WHERE SettingKey = @Key;
+        SELECT SettingKey, SettingValue, UpdatedAt, UpdatedBy FROM AppSettings WHERE SettingKey = @Key;
+      `);
+
+    if (!result.recordset.length) {
+      return res.status(404).json({ success: false, error: `Setting not found: ${req.params.key}` });
+    }
+    console.log(`✅ /api/app-settings/${req.params.key} updated to ${value} by ${updatedBy}`);
+    res.json({ success: true, data: result.recordset[0] });
+  } catch (err) {
+    console.error('❌ /api/app-settings PUT error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
 
 
 // ── GET /api/category-settings ────────────────────────────────
@@ -1688,104 +1774,6 @@ app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), a
 
 
 // ── POST /api/push-to-shopify ─────────────────────────────────
-// app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
-//   const { skuId, sp, isManual, confirmVariance } = req.body;
-
-//   if (!skuId || sp == null) {
-//     return res.status(400).json({ success: false, error: 'skuId and sp are required' });
-//   }
-//   const parsedSP = parseFloat(sp);
-//   if (isNaN(parsedSP) || parsedSP <= 0) {
-//     return res.status(400).json({ success: false, error: 'sp must be a positive number' });
-//   }
-
-//   const pushedBy = req.session?.user?.email || 'unknown';
-//   let pool;
-//   try {
-//     pool = await getSqlPool();
-
-//     // ── Variance check — against your own DB, before Shopify is touched at all ──
-//     const checkRow = await pool.request()
-//       .input('SKU_ID', sql.NVarChar(100), skuId)
-//       .query(`SELECT RecommendedSP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
-
-//     if (!checkRow.recordset.length) {
-//       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
-//     }
-
-//     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
-//     const systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
-
-//     const VARIANCE_THRESHOLD = 0.10; // 20%
-//     let variance = 0;
-//     let requiresConfirm = false;
-
-//     if (systemSP === null || isNaN(systemSP) || systemSP <= 0) {
-//       // No reliable system value to compare against (e.g. Basic Recommendations view,
-//       // where RecommendedSP is computed live and never persisted) — force confirmation
-//       // instead of silently letting anything through.
-//       requiresConfirm = true;
-//     } else {
-//       variance = Math.abs(parsedSP - systemSP) / systemSP;
-//       requiresConfirm = variance > VARIANCE_THRESHOLD;
-//     }
-
-//     if (requiresConfirm && !confirmVariance) {
-//       return res.status(422).json({
-//         success: false,
-//         error: 'variance_check_failed',
-//         message: systemSP
-//           ? `Entered SP (₹${parsedSP}) differs from system RecommendedSP (₹${systemSP}) by ${(variance * 100).toFixed(1)}%. Confirm to proceed.`
-//           : `No system-calculated RecommendedSP is stored for this SKU yet — please confirm ₹${parsedSP} is correct before pushing.`,
-//         systemSP,
-//       });
-//     }
-
-//     // Push to Shopify first — don't touch SQL if this fails
-//     await pushPriceToShopify(skuId, parsedSP);
-
-//     const request = pool.request()
-//       .input('SKU_ID',    sql.NVarChar(100),  skuId)
-//       .input('SP',        sql.Decimal(10, 2), parsedSP)
-//       .input('PushedBy',  sql.NVarChar(150),  pushedBy);
-
-//     let updateQuery = `
-//       UPDATE InternalProducts
-//       SET ShopifyPushedSP = @SP, ShopifyPushedAt = GETDATE(),
-//           ShopifyPushedBy = @PushedBy, ShopifyPushStatus = 'success'
-//     `;
-//     if (isManual) {
-//       updateQuery += `,
-//           ManualRecommendedSP = @SP, ManualRecommendedSP_UpdatedAt = GETDATE(),
-//           ManualRecommendedSP_UpdatedBy = @PushedBy
-//       `;
-//     }
-//     updateQuery += ` WHERE SKU_ID = @SKU_ID;
-//       SELECT SKU_ID, RecommendedSP, ManualRecommendedSP, ShopifyPushedSP, ShopifyPushedAt
-//       FROM InternalProducts WHERE SKU_ID = @SKU_ID;
-//     `;
-
-//     const result = await request.query(updateQuery);
-
-//     console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} | By=${pushedBy} | Manual=${!!isManual}`);
-//     res.json({ success: true, data: result.recordset[0] });
-//   } catch (err) {
-//     console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
-//     try {
-//       const failPool = await getSqlPool();
-//       await failPool.request()
-//         .input('SKU_ID', sql.NVarChar(100), skuId)
-//         .query(`UPDATE InternalProducts SET ShopifyPushStatus = 'failed' WHERE SKU_ID = @SKU_ID`);
-//     } catch (_) {}
-//     res.status(500).json({ success: false, error: err.message });
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// });
-
-
-
-// ── POST /api/push-to-shopify ─────────────────────────────────
 app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
   const { skuId, sp, isManual, confirmVariance } = req.body;
 
@@ -1815,7 +1803,7 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
     const systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
 
-    const VARIANCE_THRESHOLD = 0.20;
+    const VARIANCE_THRESHOLD = await getNumericSetting(pool, 'VARIANCE_THRESHOLD', 0.10);
     let variance = 0;
     let requiresConfirm = false;
 
