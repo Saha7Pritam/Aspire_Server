@@ -8,7 +8,6 @@ require('dotenv').config();
 const { getRecentRuns, getRunDetail, getRunSkuMatches, buildSkuMatchesCsv } = require('./services/scrapeStatsService');
 //
 
-const { syncCategoryFlags } = require('./internal_db_sync');
 const { pushPriceToShopify } = require('./services/shopifyService'); // add to top imports
 
 const express  = require('express');
@@ -421,29 +420,6 @@ app.get('/api/recommendations', async (req, res) => {
 });
 
 
-
-
-// ── POST /api/sync-category ────────────────────────────────────
-// On-demand, targeted refresh of isActive/isInStock (only those 2
-// columns) for one category, pulled live from vw_Shopify_Product_SKUs.
-// Triggered from the UI when the user picks a category filter — NOT
-// on search, since a single dropdown selection is one bounded call,
-// unlike per-keystroke search which would hammer the DB.
-app.post('/api/sync-category', requireAuth, async (req, res) => {
-  try {
-    const { category } = req.body;
-    if (!category) {
-      return res.status(400).json({ success: false, error: 'category is required' });
-    }
-
-    const result = await syncCategoryFlags(category);
-    console.log(`✅ /api/sync-category — "${category}": matched ${result.matched}, updated ${result.updated}`);
-    res.json({ success: true, data: result });
-  } catch (err) {
-    console.error('❌ /api/sync-category error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
 
 
 
