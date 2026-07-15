@@ -1563,6 +1563,22 @@ app.get('/api/scrape-stats/:runId/sku-matches.csv', requireRole(['admin', 'super
 
 
 
+app.get('/api/scrape-stats/:runId/sku-matches', requireRole(['admin', 'supervisor']), async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const data = await getRunSkuMatches(pool, req.params.runId);
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('❌ /api/scrape-stats/:runId/sku-matches error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
 // ── GET /api/health ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -1675,6 +1691,9 @@ app.post('/api/category-mappings', requireRole(['admin', 'supervisor']), async (
     if (pool) await pool.close();
   }
 });
+
+
+
 
 
 // ── DELETE /api/category-mappings/:id ────────────────────────
