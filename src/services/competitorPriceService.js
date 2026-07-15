@@ -78,18 +78,16 @@ const STORE_SKU_FIELDS = {
   fgtech     : (p) => firstSku(p.sku, p.modelNumber),
 };
 
-// ── Lightweight extractor — used by the scrape-stats service to count
-// matched/unmatched/out-of-stock BEFORE the product is upserted into
-// CompetitorPrices. Mirrors mapProduct() exactly so stats never disagree
-// with what actually ends up in the DB. Returns null SKU/store for any
-// product whose store isn't recognized (counted as "no SKU" in stats).
 function extractSkuAndStock(product) {
   const store = String(product.storeName || product.store || '').toLowerCase();
   const getSku = STORE_SKU_FIELDS[store];
   return {
     store,
-    sku        : getSku ? getSku(product) : null,
-    stockStatus: product.stockStatus || null,
+    sku            : getSku ? getSku(product) : null,
+    stockStatus    : product.stockStatus || null,
+    competitorPrice: parsePrice(product.salePrice),
+    productUrl     : product.url || null,
+    scrapedAt      : product.scrapedAt || null,
   };
 }
 
