@@ -4,14 +4,18 @@
 //   - buildPriceMap now stores { price, date } where date is col_date
 //   - combineData now includes LastBillDate (most recent bill date per SKU)
 //     so internal_db_sync can write it to InternalProducts.
-//   - NEW: fetchShopifyFlagsByCategory(category) — targeted, lightweight
-//     read of just is_enabled/in_stock for one category, used by the
-//     on-demand category-filter sync (no full Zoho+Shopify pull).
-//   - sanitizeSKU is now exported so callers writing back to
+//   - sanitizeSKU is exported so callers writing back to
 //     InternalProducts use the exact same SKU format that was stored.
+//
+// REMOVED:
+//   - fetchShopifyFlagsByCategory(category) — the targeted, lightweight
+//     flags-only read used by the on-demand category-filter sync has
+//     been removed. That sync path no longer exists (isActive/isInStock
+//     are now updated exclusively by the daily 9 AM full sync via
+//     syncInternalProducts / fetchCombinedData). The `mssql` import
+//     (`sql`) is also removed since this was its only user in this file.
 // ─────────────────────────────────────────────────────────────
 
-const sql = require('mssql');
 const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
 
 const { connectWithRetry } = require('../utils/connectWithRetry');
@@ -129,31 +133,6 @@ async function fetchShopifySKUs() {
   return rows;
 }
 
-// ── NEW: targeted flags-only fetch for ONE category ───────────
-// Used by the on-demand category-filter sync. Deliberately narrow —
-// only the 2 columns that matter (is_enabled/in_stock) for the SKUs
-// in this category, not a full Zoho+Shopify pull like fetchCombinedData.
-async function fetchShopifyFlagsByCategory(category) {
-  console.log(`📡 Fetching flags for category "${category}" from vw_Shopify_Product_SKUs...`);
-  const accessToken = await getToken('db_returns_accesstoken');
-
-  let pool;
-  try {
-    pool = await connectWithRetry(buildConfig(DB_RETURNS, accessToken), { label: DB_RETURNS });
-    const result = await pool.request()
-      .input('category', sql.NVarChar(200), category)
-      .query(`
-        SELECT sku, is_enabled, in_stock
-        FROM [dbo].[vw_Shopify_Product_SKUs]
-        WHERE shopify_type_name = @category
-      `);
-    console.log(`   ✅ ${result.recordset.length} rows for category "${category}"`);
-    return result.recordset;
-  } finally {
-    if (pool) await pool.close();
-  }
-}
-
 // ── Build price map — keeps most recent entry per SKU ─────────
 // Now also stores the bill date so it can be written to LastBillDate.
 function buildPriceMap(zohoRows) {
@@ -248,12 +227,10 @@ function clearTokenTimers() {
 module.exports = {
   fetchPurchasePrices,
   fetchShopifySKUs,
-  fetchShopifyFlagsByCategory,
   fetchCombinedData,
   clearTokenTimers,
   sanitizeSKU,
 };
-
 
 
 

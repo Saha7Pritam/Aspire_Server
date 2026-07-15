@@ -9,12 +9,16 @@
 //     that only happens in the require.main guard at the bottom, so
 //     it's safe to `require()` this file from api_server.js or an
 //     Azure Function without risking a crash of the whole process.
-//   - syncCategoryFlags(category) — targeted isActive/isInStock-only
-//     sync for one category, used by the on-demand category-filter
-//     sync from the UI. Deliberately does NOT use a TVP (that would
-//     require a new SQL Server table type + a DB migration) — it
-//     batches parameterized UPDATE statements in one round trip
-//     instead, which is plenty for category-sized row counts.
+//
+// REMOVED:
+//   - syncCategoryFlags(category) — the on-demand, per-category
+//     isActive/isInStock sync triggered from the UI on category
+//     switch has been removed entirely per product decision: no
+//     manual trigger, full stop. isActive/isInStock are now updated
+//     exclusively by syncInternalProducts() via the 9 AM daily
+//     timer trigger (see azure-functions/internal-db-sync-trigger).
+//     fetchShopifyFlagsByCategory and sanitizeSKU are no longer
+//     imported here since nothing in this file uses them anymore.
 
 require('dotenv/config');
 const sql = require('mssql');
@@ -22,8 +26,6 @@ const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identi
 const { connectWithRetry } = require('./utils/connectWithRetry');
 const {
   fetchCombinedData,
-  fetchShopifyFlagsByCategory,
-  sanitizeSKU,
   clearTokenTimers,
 } = require('./services/azureSqlService.js');
 
@@ -163,59 +165,7 @@ async function syncInternalProducts() {
   return { rowsTouched: result.rowsAffected[0], mergeSec, totalSec };
 }
 
-// ── NEW: targeted isActive/isInStock-only sync for ONE category ──
-async function syncCategoryFlags(category) {
-  if (!category) throw new Error('syncCategoryFlags: category is required');
-
-  const startTime = Date.now();
-  const rows = await fetchShopifyFlagsByCategory(category);
-
-  if (rows.length === 0) {
-    console.log(`   ⚠️  No Shopify rows found for category "${category}"`);
-    return { category, matched: 0, updated: 0 };
-  }
-
-  const pool = await getTargetPool();
-  try {
-    const request = pool.request();
-    const statements = [];
-    let bound = 0;
-
-    rows.forEach((row) => {
-      const sku = sanitizeSKU(row.sku);
-      if (!sku) return;
-
-      request.input(`sku${bound}`,       sql.NVarChar(100), sku);
-      request.input(`isActive${bound}`,  sql.Bit, row.is_enabled ? 1 : 0);
-      request.input(`isInStock${bound}`, sql.Bit, row.in_stock   ? 1 : 0);
-
-      statements.push(`
-        UPDATE InternalProducts
-        SET isActive = @isActive${bound}, isInStock = @isInStock${bound}, UpdatedAt = GETDATE()
-        WHERE SKU_ID = @sku${bound};
-      `);
-      bound++;
-    });
-
-    if (statements.length === 0) {
-      return { category, matched: rows.length, updated: 0 };
-    }
-
-    const result = await request.query(statements.join('\n'));
-    const updated = Array.isArray(result.rowsAffected)
-      ? result.rowsAffected.reduce((a, b) => a + b, 0)
-      : 0;
-
-    const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`   🔄 Category "${category}" — matched ${rows.length}, updated ${updated} rows (${totalSec}s)`);
-
-    return { category, matched: rows.length, updated };
-  } finally {
-    await pool.close();
-  }
-}
-
-module.exports = { syncInternalProducts, syncCategoryFlags };
+module.exports = { syncInternalProducts };
 
 // ── Only run automatically when executed directly ─────────────
 // (`node src/internal_db_sync.js`), NOT when required by
