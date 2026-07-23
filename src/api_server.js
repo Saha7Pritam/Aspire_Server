@@ -40,6 +40,20 @@ const { requireRole } = require('./auth/authMiddleware');
 const app  = express();
 const PORT = process.env.PORT || 8000;
 
+
+
+// app.js (or wherever you set up Express)
+const { log } = require('../blobLogger');
+
+// request logging
+app.use((req, res, next) => {
+  log('INFO', 'app.js', 'requestLogger', `${req.method} ${req.originalUrl} - IP: ${req.ip}`);
+  next();
+});
+
+
+
+
 app.use(cors({
   origin     : process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true,
@@ -1895,7 +1909,11 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
 
 
 
-
+// error logging — after all routes
+app.use((err, req, res, next) => {
+  log('ERROR', 'app.js', 'errorHandler', err.stack || err.message);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
 
 
 
