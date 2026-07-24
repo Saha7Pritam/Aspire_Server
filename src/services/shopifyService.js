@@ -1,12 +1,13 @@
 // src/services/shopifyService.js
 const axios = require('axios');
+const { log } = require('../../blobLogger');
 
-const SHOPIFY_STORE_URL     = process.env.shopify_store_url;      // e.g. tpstech.myshopify.com — used for OAuth token exchange
-const SHOPIFY_GRAPHQL_URL   = process.env.Shopify_graph_URL;      // full graphql.json endpoint
+const SHOPIFY_STORE_URL     = process.env.shopify_store_url;
+const SHOPIFY_GRAPHQL_URL   = process.env.Shopify_graph_URL;
 const SHOPIFY_CLIENT_ID     = process.env.shopify_prod_clientid;
 const SHOPIFY_CLIENT_SECRET = process.env.shopify_prod_secret;
 
-const TOKEN_MAX_AGE_MS = 20 * 60 * 60 * 1000; // hard refresh every 20h regardless of Shopify's expires_in (UTC vs IST safety)
+const TOKEN_MAX_AGE_MS = 20 * 60 * 60 * 1000;
 
 let cachedToken = null;
 let tokenFetchedAt = 0;
@@ -31,9 +32,11 @@ async function getAccessToken() {
     );
     cachedToken = response.data.access_token;
     tokenFetchedAt = Date.now();
+    log('INFO', 'shopifyService.js', 'getAccessToken', 'Shopify access token refreshed');
     return cachedToken;
   } catch (err) {
     const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    log('ERROR', 'shopifyService.js', 'getAccessToken', `Token exchange failed: ${detail}`);
     throw new Error(`Token exchange failed: ${detail}`);
   }
 }
@@ -48,11 +51,13 @@ async function shopifyGraphQL(query, variables) {
       { headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken } }
     );
     if (response.data.errors) {
+      log('ERROR', 'shopifyService.js', 'shopifyGraphQL', `GraphQL error: ${JSON.stringify(response.data.errors)}`);
       throw new Error(`Shopify GraphQL error: ${JSON.stringify(response.data.errors)}`);
     }
     return response.data.data;
   } catch (err) {
     if (err.response?.data) {
+      log('ERROR', 'shopifyService.js', 'shopifyGraphQL', `Request failed: ${JSON.stringify(err.response.data)}`);
       throw new Error(`Shopify request failed: ${JSON.stringify(err.response.data)}`);
     }
     throw err;
@@ -69,10 +74,16 @@ async function getShopifyVariantBySku(sku) {
     }
   `;
   const data = await shopifyGraphQL(query, { query: `sku:${sku}` });
-  const matches = data.productVariants.edges.filter(e => e.node.sku === sku); // exact match only
+  const matches = data.productVariants.edges.filter(e => e.node.sku === sku);
 
-  if (matches.length === 0) throw new Error(`No Shopify variant found for SKU: ${sku}`);
-  if (matches.length > 1) throw new Error(`Ambiguous SKU: ${sku} matched ${matches.length} variants — refusing to guess`);
+  if (matches.length === 0) {
+    log('ERROR', 'shopifyService.js', 'getShopifyVariantBySku', `No Shopify variant found for SKU: ${sku}`);
+    throw new Error(`No Shopify variant found for SKU: ${sku}`);
+  }
+  if (matches.length > 1) {
+    log('ERROR', 'shopifyService.js', 'getShopifyVariantBySku', `Ambiguous SKU: ${sku} matched ${matches.length} variants`);
+    throw new Error(`Ambiguous SKU: ${sku} matched ${matches.length} variants — refusing to guess`);
+  }
 
   const node = matches[0].node;
   return { variantId: node.id, productId: node.product.id };
@@ -93,17 +104,158 @@ async function updateVariantPrice(productId, variantId, price) {
     variants: [{ id: variantId, price: String(price) }],
   });
   const errors = data.productVariantsBulkUpdate.userErrors;
-  if (errors?.length) throw new Error(`Shopify userErrors: ${JSON.stringify(errors)}`);
+  if (errors?.length) {
+    log('ERROR', 'shopifyService.js', 'updateVariantPrice', `userErrors: ${JSON.stringify(errors)}`);
+    throw new Error(`Shopify userErrors: ${JSON.stringify(errors)}`);
+  }
   return data.productVariantsBulkUpdate.productVariants[0];
 }
 
 async function pushPriceToShopify(skuId, price) {
   const { variantId, productId } = await getShopifyVariantBySku(skuId);
   const updated = await updateVariantPrice(productId, variantId, price);
+  log('INFO', 'shopifyService.js', 'pushPriceToShopify', `Pushed price ${updated.price} for SKU: ${skuId}`);
   return { variantId, productId, price: updated.price };
 }
 
 module.exports = { pushPriceToShopify };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// src/services/shopifyService.js
+// const axios = require('axios');
+
+// const SHOPIFY_STORE_URL     = process.env.shopify_store_url;      // e.g. tpstech.myshopify.com — used for OAuth token exchange
+// const SHOPIFY_GRAPHQL_URL   = process.env.Shopify_graph_URL;      // full graphql.json endpoint
+// const SHOPIFY_CLIENT_ID     = process.env.shopify_prod_clientid;
+// const SHOPIFY_CLIENT_SECRET = process.env.shopify_prod_secret;
+
+// const TOKEN_MAX_AGE_MS = 20 * 60 * 60 * 1000; // hard refresh every 20h regardless of Shopify's expires_in (UTC vs IST safety)
+
+// let cachedToken = null;
+// let tokenFetchedAt = 0;
+
+// // ── Get (or refresh) the OAuth access token ───────────────────
+// async function getAccessToken() {
+//   if (cachedToken && (Date.now() - tokenFetchedAt) < TOKEN_MAX_AGE_MS) {
+//     return cachedToken;
+//   }
+
+//   try {
+//     const params = new URLSearchParams({
+//       client_id: SHOPIFY_CLIENT_ID,
+//       client_secret: SHOPIFY_CLIENT_SECRET,
+//       grant_type: 'client_credentials',
+//     });
+
+//     const response = await axios.post(
+//       `https://${SHOPIFY_STORE_URL}/admin/oauth/access_token`,
+//       params.toString(),
+//       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+//     );
+//     cachedToken = response.data.access_token;
+//     tokenFetchedAt = Date.now();
+//     return cachedToken;
+//   } catch (err) {
+//     const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+//     throw new Error(`Token exchange failed: ${detail}`);
+//   }
+// }
+
+// // ── Generic GraphQL call helper ───────────────────────────────
+// async function shopifyGraphQL(query, variables) {
+//   const accessToken = await getAccessToken();
+//   try {
+//     const response = await axios.post(
+//       SHOPIFY_GRAPHQL_URL,
+//       { query, variables },
+//       { headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken } }
+//     );
+//     if (response.data.errors) {
+//       throw new Error(`Shopify GraphQL error: ${JSON.stringify(response.data.errors)}`);
+//     }
+//     return response.data.data;
+//   } catch (err) {
+//     if (err.response?.data) {
+//       throw new Error(`Shopify request failed: ${JSON.stringify(err.response.data)}`);
+//     }
+//     throw err;
+//   }
+// }
+
+// // ── Step 1: look up variant + product ID by SKU (with duplicate-safety) ──
+// async function getShopifyVariantBySku(sku) {
+//   const query = `
+//     query getVariantBySku($query: String!) {
+//       productVariants(first: 5, query: $query) {
+//         edges { node { id price sku product { id } } }
+//       }
+//     }
+//   `;
+//   const data = await shopifyGraphQL(query, { query: `sku:${sku}` });
+//   const matches = data.productVariants.edges.filter(e => e.node.sku === sku); // exact match only
+
+//   if (matches.length === 0) throw new Error(`No Shopify variant found for SKU: ${sku}`);
+//   if (matches.length > 1) throw new Error(`Ambiguous SKU: ${sku} matched ${matches.length} variants — refusing to guess`);
+
+//   const node = matches[0].node;
+//   return { variantId: node.id, productId: node.product.id };
+// }
+
+// // ── Step 2: update the price ──────────────────────────────────
+// async function updateVariantPrice(productId, variantId, price) {
+//   const mutation = `
+//     mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+//       productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+//         productVariants { id price }
+//         userErrors { field message }
+//       }
+//     }
+//   `;
+//   const data = await shopifyGraphQL(mutation, {
+//     productId,
+//     variants: [{ id: variantId, price: String(price) }],
+//   });
+//   const errors = data.productVariantsBulkUpdate.userErrors;
+//   if (errors?.length) throw new Error(`Shopify userErrors: ${JSON.stringify(errors)}`);
+//   return data.productVariantsBulkUpdate.productVariants[0];
+// }
+
+// async function pushPriceToShopify(skuId, price) {
+//   const { variantId, productId } = await getShopifyVariantBySku(skuId);
+//   const updated = await updateVariantPrice(productId, variantId, price);
+//   return { variantId, productId, price: updated.price };
+// }
+
+// module.exports = { pushPriceToShopify };
 
 
 

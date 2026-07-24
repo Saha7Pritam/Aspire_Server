@@ -21,6 +21,7 @@
     "@azure/cosmos": "^4.9.3",
     "@azure/identity": "^4.13.1",
     "@azure/msal-node": "^5.2.2",
+    "@azure/storage-blob": "^12.32.0",
     "cheerio": "^1.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
